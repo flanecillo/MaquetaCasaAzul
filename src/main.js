@@ -394,50 +394,66 @@ window.addEventListener("resize", () => {
 });
 
 // ─────────────────────────────────────────────
-// Giroscopio (móvil) — sin gimbal lock
+// Giroscopio (móvil) — sin gimbal lock, toggle on/off
 // ─────────────────────────────────────────────
-let gyroEnabled = false;
-const GYRO_LERP = 0.06;
+let gyroEnabled    = false;
+let gyroReady      = false; // true una vez que el sensor/listener está corriendo
+const GYRO_LERP    = 0.06;
 
-// Quaternion crudo que llega del sensor (actualizado en el listener)
-const _sensorQuat  = new THREE.Quaternion();
-// Quaternion objetivo suavizado que se aplica a la cámara en tick()
-const _targetQuat  = new THREE.Quaternion();
+// Quaternion que llega del sensor en cada frame (actualizado por el listener)
+const _rawSensorQuat = new THREE.Quaternion();
+// Quaternion objetivo final que se aplica a la cámara en tick()
+const _targetQuat    = new THREE.Quaternion();
 
-// Corrección de ejes: los sensores usan ENU (East-North-Up),
-// Three.js usa un sistema distinto. Esta rotación convierte entre ambos.
-// -90° en X rota el "arriba del sensor" para que coincida con -Z de Three.js.
+// Offset de calibración: se calcula al activar el gyro para que la cámara
+// no salte — continúa desde donde el usuario la dejó con OrbitControls.
+// Formula: _calibOffset = sensorQuat_inv * cameraQuat
+// En tick(): targetQuat = sensorQuat * _calibOffset
+const _calibOffset   = new THREE.Quaternion();
+
+// Corrección de ejes ENU → Three.js (-90° en X)
 const _axisCorrection = new THREE.Quaternion();
 _axisCorrection.setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
 
-// Corrección de offset portrait: el teléfono en posición natural mira ~70°
-// hacia abajo respecto al eje del sensor. Esto lo centra.
+// Offset portrait (teléfono inclinado ~70° en posición natural de lectura)
 const _portraitOffset = new THREE.Quaternion();
 _portraitOffset.setFromAxisAngle(
   new THREE.Vector3(1, 0, 0),
-  THREE.MathUtils.degToRad(20)  // ajusta si la cámara apunta muy arriba/abajo
+  THREE.MathUtils.degToRad(20), // ajusta si la cámara apunta muy arriba/abajo
 );
 
-// ── Estrategia 1: AbsoluteOrientationSensor (Android Chrome, sin gimbal lock)
-// Entrega un quaternion directamente — no hay conversión Euler → no hay saltos.
+// Calcula _rawSensorQuat con correcciones de eje aplicadas
+function buildCorrectedQuat(raw) {
+  _rawSensorQuat.copy(_axisCorrection).multiply(raw).multiply(_portraitOffset);
+}
+
+// ── Calibrar offset al momento de activar ───────────────────
+// Captura la diferencia entre la orientación actual del sensor y la de la cámara,
+// para que al activar el gyro la vista no salte.
+function calibrate() {
+  // _calibOffset = rawSensorQuat⁻¹ * camera.quaternion
+  _calibOffset.copy(_rawSensorQuat).invert().multiply(camera.quaternion);
+  // Sincronizar _targetQuat con la cámara actual para que el slerp parta de ahí
+  _targetQuat.copy(camera.quaternion);
+}
+
+// ── Estrategia 1: AbsoluteOrientationSensor (Android Chrome) ─
 function startAbsoluteOrientationSensor() {
   try {
     const sensor = new AbsoluteOrientationSensor({ frequency: 60, referenceFrame: "screen" });
+    const _q = new THREE.Quaternion();
 
     sensor.addEventListener("reading", () => {
-      // sensor.quaternion = [x, y, z, w]
-      _sensorQuat.set(
-        sensor.quaternion[0],
-        sensor.quaternion[1],
-        sensor.quaternion[2],
-        sensor.quaternion[3],
-      );
-      // Aplicar corrección de ejes ENU → Three.js
-      _targetQuat.copy(_axisCorrection).multiply(_sensorQuat).multiply(_portraitOffset);
+      _q.set(sensor.quaternion[0], sensor.quaternion[1], sensor.quaternion[2], sensor.quaternion[3]);
+      buildCorrectedQuat(_q);
+      if (gyroEnabled) {
+        // Aplicar offset de calibración para continuar desde donde estaba la cámara
+        _targetQuat.copy(_rawSensorQuat).multiply(_calibOffset);
+      }
     });
 
     sensor.addEventListener("error", (e) => {
-      console.warn("AbsoluteOrientationSensor error, fallback a deviceorientation:", e);
+      console.warn("AbsoluteOrientationSensor error, usando fallback:", e);
       startDeviceOrientationFallback();
     });
 
@@ -448,36 +464,34 @@ function startAbsoluteOrientationSensor() {
   }
 }
 
-// ── Estrategia 2: deviceorientation (fallback iOS / navegadores sin Sensor API)
-// Construimos el quaternion desde la matriz de rotación completa para evitar
-// el flip de beta/gamma al cruzar ciertos ángulos.
+// ── Estrategia 2: deviceorientation (fallback iOS / Firefox) ─
 function startDeviceOrientationFallback() {
   const _m = new THREE.Matrix4();
-  const _z = new THREE.Vector3(0, 0, 1);
-  const _y = new THREE.Vector3(0, 1, 0);
+  const _q = new THREE.Quaternion();
 
   window.addEventListener("deviceorientation", (e) => {
     const alpha = THREE.MathUtils.degToRad(e.alpha ?? 0);
     const beta  = THREE.MathUtils.degToRad(e.beta  ?? 0);
     const gamma = THREE.MathUtils.degToRad(e.gamma ?? 0);
 
-    // Construir la matriz de rotación ZXY (orden estándar de deviceorientation)
-    // en lugar de usar Euler directo → evita el gimbal lock en los extremos
     _m.makeRotationFromEuler(new THREE.Euler(beta, alpha, -gamma, "ZXY"));
-    _targetQuat.setFromRotationMatrix(_m);
-    _targetQuat.premultiply(_axisCorrection);
-    _targetQuat.multiply(_portraitOffset);
+    _q.setFromRotationMatrix(_m);
+    buildCorrectedQuat(_q);
+    if (gyroEnabled) {
+      _targetQuat.copy(_rawSensorQuat).multiply(_calibOffset);
+    }
   });
 }
 
-async function requestGyroPermission() {
-  // iOS 13+ requiere permiso explícito antes de cualquier listener
+// ── Inicializar sensor (solo una vez, la primera vez que el usuario activa) ──
+async function initSensor() {
+  if (gyroReady) return true;
+
   if (typeof DeviceOrientationEvent?.requestPermission === "function") {
     const result = await DeviceOrientationEvent.requestPermission();
     if (result !== "granted") return false;
   }
 
-  // Intentar la API moderna primero, si falla usar el fallback
   const hasSensorAPI = typeof AbsoluteOrientationSensor !== "undefined";
   if (hasSensorAPI) {
     try {
@@ -494,23 +508,35 @@ async function requestGyroPermission() {
     startDeviceOrientationFallback();
   }
 
-  // Inicializar _targetQuat con la orientación actual de la cámara
-  // para evitar el "salto inicial" al activar el gyro
-  _targetQuat.copy(camera.quaternion);
-
-  gyroEnabled = true;
-  controls.enabled = false;
+  gyroReady = true;
   return true;
 }
 
-// ── Botón de giroscopio (solo visible en móvil) ──────────────
+// ── Activar / desactivar gyro ────────────────────────────────
+function enableGyro() {
+  calibrate();           // fijar offset desde posición actual de la cámara
+  gyroEnabled = true;
+  controls.enabled = false;
+}
+
+function disableGyro() {
+  gyroEnabled = false;
+  controls.enabled = true;
+  // Sincronizar el target de OrbitControls con la dirección actual de la cámara
+  // para que al retomar touch no haya salto en el pivot
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  controls.target.copy(camera.position).addScaledVector(dir, 5);
+  controls.update();
+}
+
+// ── Botón toggle (solo visible en móvil) ─────────────────────
 const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
 let gyroBtn = null;
 
 if (isMobile) {
   gyroBtn = document.createElement("button");
   gyroBtn.id = "gyroBtn";
-  gyroBtn.textContent = "🌀 Activar giroscopio";
   gyroBtn.className = "visit-btn visible";
   gyroBtn.style.cssText = `
     top: auto;
@@ -520,18 +546,37 @@ if (isMobile) {
     opacity: 1;
     pointer-events: all;
   `;
+
+  function updateGyroBtnState() {
+    gyroBtn.textContent = gyroEnabled ? "⏹ Desactivar giroscopio" : "🌀 Activar giroscopio";
+    gyroBtn.style.background = gyroEnabled
+      ? "rgba(6, 164, 178, 0.35)"
+      : "rgba(6, 164, 178, 0.15)";
+    gyroBtn.style.boxShadow = gyroEnabled
+      ? "0 0 20px rgba(6, 164, 178, 0.4)"
+      : "none";
+  }
+
+  updateGyroBtnState();
   app.appendChild(gyroBtn);
 
   gyroBtn.addEventListener("click", async () => {
-    const ok = await requestGyroPermission();
-    if (ok) {
-      gyroBtn.textContent = "✓ Giroscopio activo";
-      gyroBtn.style.opacity = "0.5";
-      gyroBtn.style.pointerEvents = "none";
-      setTimeout(() => (gyroBtn.style.display = "none"), 1500);
-    } else {
-      gyroBtn.textContent = "⚠ Permiso denegado";
+    if (!gyroReady) {
+      const ok = await initSensor();
+      if (!ok) {
+        gyroBtn.textContent = "⚠ Permiso denegado";
+        return;
+      }
+      // Pequeña espera para que el sensor emita al menos un frame antes de calibrar
+      await new Promise((r) => setTimeout(r, 150));
     }
+
+    if (gyroEnabled) {
+      disableGyro();
+    } else {
+      enableGyro();
+    }
+    updateGyroBtnState();
   });
 }
 
