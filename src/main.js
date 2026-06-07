@@ -394,32 +394,111 @@ window.addEventListener("resize", () => {
 });
 
 // ─────────────────────────────────────────────
-// Giroscopio (móvil)
+// Giroscopio (móvil) — sin gimbal lock
 // ─────────────────────────────────────────────
-const gyro = { beta: 0, gamma: 0 };
 let gyroEnabled = false;
-const _gyroQuat = new THREE.Quaternion();
-const _gyroEuler = new THREE.Euler();
-const GYRO_LERP = 0.06; // suavizado: más bajo = más suave
+const GYRO_LERP = 0.06;
 
-// Offset para posición "natural" del teléfono en portrait
-// beta ≈ 70° = teléfono inclinado para ver la pantalla
-const BETA_OFFSET_DEG = 70;
+// Quaternion crudo que llega del sensor (actualizado en el listener)
+const _sensorQuat  = new THREE.Quaternion();
+// Quaternion objetivo suavizado que se aplica a la cámara en tick()
+const _targetQuat  = new THREE.Quaternion();
 
-function onDeviceOrientation(e) {
-  gyro.beta  = e.beta  ?? 0;
-  gyro.gamma = e.gamma ?? 0;
+// Corrección de ejes: los sensores usan ENU (East-North-Up),
+// Three.js usa un sistema distinto. Esta rotación convierte entre ambos.
+// -90° en X rota el "arriba del sensor" para que coincida con -Z de Three.js.
+const _axisCorrection = new THREE.Quaternion();
+_axisCorrection.setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+
+// Corrección de offset portrait: el teléfono en posición natural mira ~70°
+// hacia abajo respecto al eje del sensor. Esto lo centra.
+const _portraitOffset = new THREE.Quaternion();
+_portraitOffset.setFromAxisAngle(
+  new THREE.Vector3(1, 0, 0),
+  THREE.MathUtils.degToRad(20)  // ajusta si la cámara apunta muy arriba/abajo
+);
+
+// ── Estrategia 1: AbsoluteOrientationSensor (Android Chrome, sin gimbal lock)
+// Entrega un quaternion directamente — no hay conversión Euler → no hay saltos.
+function startAbsoluteOrientationSensor() {
+  try {
+    const sensor = new AbsoluteOrientationSensor({ frequency: 60, referenceFrame: "screen" });
+
+    sensor.addEventListener("reading", () => {
+      // sensor.quaternion = [x, y, z, w]
+      _sensorQuat.set(
+        sensor.quaternion[0],
+        sensor.quaternion[1],
+        sensor.quaternion[2],
+        sensor.quaternion[3],
+      );
+      // Aplicar corrección de ejes ENU → Three.js
+      _targetQuat.copy(_axisCorrection).multiply(_sensorQuat).multiply(_portraitOffset);
+    });
+
+    sensor.addEventListener("error", (e) => {
+      console.warn("AbsoluteOrientationSensor error, fallback a deviceorientation:", e);
+      startDeviceOrientationFallback();
+    });
+
+    sensor.start();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Estrategia 2: deviceorientation (fallback iOS / navegadores sin Sensor API)
+// Construimos el quaternion desde la matriz de rotación completa para evitar
+// el flip de beta/gamma al cruzar ciertos ángulos.
+function startDeviceOrientationFallback() {
+  const _m = new THREE.Matrix4();
+  const _z = new THREE.Vector3(0, 0, 1);
+  const _y = new THREE.Vector3(0, 1, 0);
+
+  window.addEventListener("deviceorientation", (e) => {
+    const alpha = THREE.MathUtils.degToRad(e.alpha ?? 0);
+    const beta  = THREE.MathUtils.degToRad(e.beta  ?? 0);
+    const gamma = THREE.MathUtils.degToRad(e.gamma ?? 0);
+
+    // Construir la matriz de rotación ZXY (orden estándar de deviceorientation)
+    // en lugar de usar Euler directo → evita el gimbal lock en los extremos
+    _m.makeRotationFromEuler(new THREE.Euler(beta, alpha, -gamma, "ZXY"));
+    _targetQuat.setFromRotationMatrix(_m);
+    _targetQuat.premultiply(_axisCorrection);
+    _targetQuat.multiply(_portraitOffset);
+  });
 }
 
 async function requestGyroPermission() {
+  // iOS 13+ requiere permiso explícito antes de cualquier listener
   if (typeof DeviceOrientationEvent?.requestPermission === "function") {
-    // iOS 13+ requiere gesto explícito
     const result = await DeviceOrientationEvent.requestPermission();
     if (result !== "granted") return false;
   }
-  window.addEventListener("deviceorientation", onDeviceOrientation);
+
+  // Intentar la API moderna primero, si falla usar el fallback
+  const hasSensorAPI = typeof AbsoluteOrientationSensor !== "undefined";
+  if (hasSensorAPI) {
+    try {
+      await Promise.all([
+        navigator.permissions.query({ name: "accelerometer" }),
+        navigator.permissions.query({ name: "gyroscope" }),
+        navigator.permissions.query({ name: "magnetometer" }),
+      ]);
+      startAbsoluteOrientationSensor();
+    } catch {
+      startDeviceOrientationFallback();
+    }
+  } else {
+    startDeviceOrientationFallback();
+  }
+
+  // Inicializar _targetQuat con la orientación actual de la cámara
+  // para evitar el "salto inicial" al activar el gyro
+  _targetQuat.copy(camera.quaternion);
+
   gyroEnabled = true;
-  // Desactivar OrbitControls para que el gyro tome el control total
   controls.enabled = false;
   return true;
 }
@@ -491,11 +570,7 @@ function tick() {
 
   // ── Giroscopio ──
   if (gyroEnabled && !isAnimating) {
-    const pitch = THREE.MathUtils.degToRad(gyro.beta  - BETA_OFFSET_DEG);
-    const yaw   = THREE.MathUtils.degToRad(gyro.gamma * 0.8);
-    _gyroEuler.set(pitch, yaw, 0, "YXZ");
-    _gyroQuat.setFromEuler(_gyroEuler);
-    camera.quaternion.slerp(_gyroQuat, GYRO_LERP);
+    camera.quaternion.slerp(_targetQuat, GYRO_LERP);
   }
 
   renderer.render(scene, camera);
