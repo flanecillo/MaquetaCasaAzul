@@ -46,6 +46,8 @@ app.innerHTML = `
       <div><strong>Mouse:</strong> clic derecho mueve</div>
       <div><strong>Rueda:</strong> zoom</div>
       <br />
+      <div><strong>Móvil:</strong> activa el giroscopio para controlar la cámara inclinando el teléfono.</div>
+      <br />
       <div><strong>Debug:</strong> mueve la esfera verde y roja para obtener coordenadas.</div>
     </div>
   </aside>
@@ -392,6 +394,69 @@ window.addEventListener("resize", () => {
 });
 
 // ─────────────────────────────────────────────
+// Giroscopio (móvil)
+// ─────────────────────────────────────────────
+const gyro = { beta: 0, gamma: 0 };
+let gyroEnabled = false;
+const _gyroQuat = new THREE.Quaternion();
+const _gyroEuler = new THREE.Euler();
+const GYRO_LERP = 0.06; // suavizado: más bajo = más suave
+
+// Offset para posición "natural" del teléfono en portrait
+// beta ≈ 70° = teléfono inclinado para ver la pantalla
+const BETA_OFFSET_DEG = 70;
+
+function onDeviceOrientation(e) {
+  gyro.beta  = e.beta  ?? 0;
+  gyro.gamma = e.gamma ?? 0;
+}
+
+async function requestGyroPermission() {
+  if (typeof DeviceOrientationEvent?.requestPermission === "function") {
+    // iOS 13+ requiere gesto explícito
+    const result = await DeviceOrientationEvent.requestPermission();
+    if (result !== "granted") return false;
+  }
+  window.addEventListener("deviceorientation", onDeviceOrientation);
+  gyroEnabled = true;
+  // Desactivar OrbitControls para que el gyro tome el control total
+  controls.enabled = false;
+  return true;
+}
+
+// ── Botón de giroscopio (solo visible en móvil) ──────────────
+const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+let gyroBtn = null;
+
+if (isMobile) {
+  gyroBtn = document.createElement("button");
+  gyroBtn.id = "gyroBtn";
+  gyroBtn.textContent = "🌀 Activar giroscopio";
+  gyroBtn.className = "visit-btn visible";
+  gyroBtn.style.cssText = `
+    top: auto;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    opacity: 1;
+    pointer-events: all;
+  `;
+  app.appendChild(gyroBtn);
+
+  gyroBtn.addEventListener("click", async () => {
+    const ok = await requestGyroPermission();
+    if (ok) {
+      gyroBtn.textContent = "✓ Giroscopio activo";
+      gyroBtn.style.opacity = "0.5";
+      gyroBtn.style.pointerEvents = "none";
+      setTimeout(() => (gyroBtn.style.display = "none"), 1500);
+    } else {
+      gyroBtn.textContent = "⚠ Permiso denegado";
+    }
+  });
+}
+
+// ─────────────────────────────────────────────
 // Animación principal
 // ─────────────────────────────────────────────
 const clock = new THREE.Clock();
@@ -422,6 +487,15 @@ function tick() {
       visitBtn.style.left = `${x}px`;
       visitBtn.style.top = `${y}px`;
     }
+  }
+
+  // ── Giroscopio ──
+  if (gyroEnabled && !isAnimating) {
+    const pitch = THREE.MathUtils.degToRad(gyro.beta  - BETA_OFFSET_DEG);
+    const yaw   = THREE.MathUtils.degToRad(gyro.gamma * 0.8);
+    _gyroEuler.set(pitch, yaw, 0, "YXZ");
+    _gyroQuat.setFromEuler(_gyroEuler);
+    camera.quaternion.slerp(_gyroQuat, GYRO_LERP);
   }
 
   renderer.render(scene, camera);
