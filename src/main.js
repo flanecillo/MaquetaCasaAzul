@@ -396,59 +396,60 @@ window.addEventListener("resize", () => {
 // ─────────────────────────────────────────────
 // Giroscopio (móvil) — sin gimbal lock, toggle on/off
 // ─────────────────────────────────────────────
-let gyroEnabled    = false;
-let gyroReady      = false; // true una vez que el sensor/listener está corriendo
-const GYRO_LERP    = 0.06;
+let gyroEnabled = false;
+let gyroReady   = false;
+const GYRO_LERP = 0.06;
 
-// Quaternion que llega del sensor en cada frame (actualizado por el listener)
+// Quaternion corregido del sensor (actualizado cada frame por el listener)
 const _rawSensorQuat = new THREE.Quaternion();
-// Quaternion objetivo final que se aplica a la cámara en tick()
+// Quaternion objetivo que se aplica a la cámara en tick()
 const _targetQuat    = new THREE.Quaternion();
 
-// Offset de calibración: se calcula al activar el gyro para que la cámara
-// no salte — continúa desde donde el usuario la dejó con OrbitControls.
-// Formula: _calibOffset = sensorQuat_inv * cameraQuat
-// En tick(): targetQuat = sensorQuat * _calibOffset
-const _calibOffset   = new THREE.Quaternion();
+// Offset de calibración — se aplica a la IZQUIERDA del sensor quat:
+//   Al calibrar : _calibOffset = camera.quaternion * rawSensorQuat⁻¹
+//   En tick()   : targetQuat   = _calibOffset * rawSensorQuat
+//
+// Multiplicar a la izquierda cancela el yaw absoluto (azimuth) del sensor,
+// que vive en espacio-mundo. A la derecha solo compensa pitch/roll local,
+// lo que causaba que el teléfono girase como manecilla de reloj.
+const _calibOffset = new THREE.Quaternion();
 
-// Corrección de ejes ENU → Three.js (-90° en X)
+// Corrección de ejes: lleva el "frente" del sensor al -Z de Three.js
 const _axisCorrection = new THREE.Quaternion();
 _axisCorrection.setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
 
-// Offset portrait (teléfono inclinado ~70° en posición natural de lectura)
+// Offset portrait: ajusta la inclinación natural del teléfono al leer
 const _portraitOffset = new THREE.Quaternion();
 _portraitOffset.setFromAxisAngle(
   new THREE.Vector3(1, 0, 0),
   THREE.MathUtils.degToRad(20), // ajusta si la cámara apunta muy arriba/abajo
 );
 
-// Calcula _rawSensorQuat con correcciones de eje aplicadas
+// Convierte el quaternion crudo del sensor al espacio de Three.js
 function buildCorrectedQuat(raw) {
   _rawSensorQuat.copy(_axisCorrection).multiply(raw).multiply(_portraitOffset);
 }
 
-// ── Calibrar offset al momento de activar ───────────────────
-// Captura la diferencia entre la orientación actual del sensor y la de la cámara,
-// para que al activar el gyro la vista no salte.
+// ── Calibrar al activar ──────────────────────────────────────
 function calibrate() {
-  // _calibOffset = rawSensorQuat⁻¹ * camera.quaternion
-  _calibOffset.copy(_rawSensorQuat).invert().multiply(camera.quaternion);
-  // Sincronizar _targetQuat con la cámara actual para que el slerp parta de ahí
+  // _calibOffset = camera.quaternion * rawSensorQuat⁻¹
+  _calibOffset.copy(_rawSensorQuat).invert().premultiply(camera.quaternion);
   _targetQuat.copy(camera.quaternion);
 }
 
 // ── Estrategia 1: AbsoluteOrientationSensor (Android Chrome) ─
 function startAbsoluteOrientationSensor() {
   try {
-    const sensor = new AbsoluteOrientationSensor({ frequency: 60, referenceFrame: "screen" });
+    // "device": quaternion en espacio del dispositivo físico
+    const sensor = new AbsoluteOrientationSensor({ frequency: 60, referenceFrame: "device" });
     const _q = new THREE.Quaternion();
 
     sensor.addEventListener("reading", () => {
       _q.set(sensor.quaternion[0], sensor.quaternion[1], sensor.quaternion[2], sensor.quaternion[3]);
       buildCorrectedQuat(_q);
       if (gyroEnabled) {
-        // Aplicar offset de calibración para continuar desde donde estaba la cámara
-        _targetQuat.copy(_rawSensorQuat).multiply(_calibOffset);
+        // offset a la izquierda: _calibOffset * rawSensorQuat
+        _targetQuat.copy(_calibOffset).multiply(_rawSensorQuat);
       }
     });
 
@@ -478,10 +479,11 @@ function startDeviceOrientationFallback() {
     _q.setFromRotationMatrix(_m);
     buildCorrectedQuat(_q);
     if (gyroEnabled) {
-      _targetQuat.copy(_rawSensorQuat).multiply(_calibOffset);
+      _targetQuat.copy(_calibOffset).multiply(_rawSensorQuat);
     }
   });
 }
+
 
 // ── Inicializar sensor (solo una vez, la primera vez que el usuario activa) ──
 async function initSensor() {
