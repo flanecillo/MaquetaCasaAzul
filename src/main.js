@@ -513,21 +513,43 @@ async function initSensor() {
 }
 
 // ── Activar / desactivar gyro ────────────────────────────────
+const _savedTarget = new THREE.Vector3(); // target de órbita guardado al activar
+
 function enableGyro() {
-  calibrate();           // fijar offset desde posición actual de la cámara
+  // Guardar el target actual antes de ceder el control
+  _savedTarget.copy(controls.target);
+  calibrate();
   gyroEnabled = true;
   controls.enabled = false;
 }
 
 function disableGyro() {
   gyroEnabled = false;
-  controls.enabled = true;
-  // Sincronizar el target de OrbitControls con la dirección actual de la cámara
-  // para que al retomar touch no haya salto en el pivot
-  const dir = new THREE.Vector3();
-  camera.getWorldDirection(dir);
-  controls.target.copy(camera.position).addScaledVector(dir, 5);
-  controls.update();
+
+  // Calcular el quaternion que miraría de vuelta al target guardado
+  const _lookAtQuat = new THREE.Quaternion();
+  const _lookAtM    = new THREE.Matrix4();
+  _lookAtM.lookAt(camera.position, _savedTarget, camera.up);
+  _lookAtQuat.setFromRotationMatrix(_lookAtM);
+
+  // Animar suavemente la rotación de la cámara hacia el target guardado
+  const rotProxy = { t: 0 };
+  const fromQuat = camera.quaternion.clone();
+
+  gsap.to(rotProxy, {
+    t: 1,
+    duration: 0.6,
+    ease: "power2.out",
+    onUpdate() {
+      camera.quaternion.slerpQuaternions(fromQuat, _lookAtQuat, rotProxy.t);
+    },
+    onComplete() {
+      // Restaurar el target exacto y entregar el control a OrbitControls
+      controls.target.copy(_savedTarget);
+      controls.enabled = true;
+      controls.update();
+    },
+  });
 }
 
 // ── Botón toggle (solo visible en móvil) ─────────────────────
